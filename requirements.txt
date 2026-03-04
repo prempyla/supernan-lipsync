@@ -1,0 +1,4 @@
+requests>=2.28,<3.0
+python-dotenv>=1.0
+pydub>=0.25
+soundfile>=0.12

@@ -1,0 +1,14 @@
+# API keys
+.env
+
+# Python
+__pycache__/
+venv/
+
+# Pipeline output
+output/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
