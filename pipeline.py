@@ -123,3 +123,113 @@ def extract_clip(input_video: str, start: int, end: int, output_dir: str) -> dic
     log.info(f"  ✓ Audio: {paths['clip_audio']}")
 
     return paths
+
+# ─── Stage 2: Transcribe (Sarvam Saarika) ─────────────────────────────────────
+
+def transcribe(audio_path: str, output_dir: str, api_key: str) -> str:
+    """Transcribe Kannada audio → Kannada text using Sarvam Saarika STT."""
+    log.info(f"{'='*60}")
+    log.info(f"STAGE 2: TRANSCRIBE (Sarvam Saarika — Kannada)")
+    log.info(f"{'='*60}")
+
+    _check_file(audio_path, "Audio file")
+
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    response = _sarvam_post(
+        "speech-to-text",
+        payload={
+            "language_code": "kn-IN",
+            "model": "saarika:v2",
+            "with_timestamps": False,
+            "with_disfluencies": False,
+        },
+        files={"file": ("clip_audio.wav", audio_bytes, "audio/wav")},
+        api_key=api_key,
+        description="Saarika STT"
+    )
+
+    kannada_text = response.get("transcript", "").strip()
+    if not kannada_text:
+        raise PipelineError("Saarika returned empty transcript. Is the audio audible Kannada?")
+
+    log.info(f"  ✓ Kannada: {kannada_text}")
+
+    with open(os.path.join(output_dir, "kannada.txt"), "w", encoding="utf-8") as f:
+        f.write(kannada_text)
+
+    return kannada_text
+
+
+# ─── Stage 3: Translate (Sarvam Mayura) ───────────────────────────────────────
+
+def translate(kannada_text: str, output_dir: str, api_key: str) -> str:
+    """Translate Kannada → Hindi using Sarvam Mayura (direct, no English hop)."""
+    log.info(f"{'='*60}")
+    log.info(f"STAGE 3: TRANSLATE (Sarvam Mayura — Kannada → Hindi)")
+    log.info(f"{'='*60}")
+
+    response = _sarvam_post(
+        "translate",
+        payload={
+            "input": kannada_text,
+            "source_language_code": "kn-IN",
+            "target_language_code": "hi-IN",
+            "speaker_gender": "Female",
+            "mode": CONFIG["translate_mode"],
+            "enable_preprocessing": True,
+        },
+        api_key=api_key,
+        description="Mayura Translate"
+    )
+
+    hindi_text = response.get("translated_text", "").strip()
+    if not hindi_text:
+        raise PipelineError("Mayura returned empty translation. Check API credits.")
+
+    # Validate Devanagari output
+    devanagari = [c for c in hindi_text if '\u0900' <= c <= '\u097F']
+    if not devanagari:
+        log.warning("  ⚠ No Devanagari characters — output may be transliterated English")
+
+    log.info(f"  ✓ Hindi: {hindi_text}")
+
+    with open(os.path.join(output_dir, "hindi.txt"), "w", encoding="utf-8") as f:
+        f.write(hindi_text)
+
+    return hindi_text
+
+# ─── Stage 4: TTS (Sarvam Bulbul v3) ─────────────────────────────────────────
+def generate_speech(hindi_text: str, output_dir: str, api_key: str) -> str:
+    """Generate Hindi speech using Sarvam Bulbul v3 TTS."""
+    log.info(f"{'='*60}")
+    log.info(f"STAGE 4: TTS (Sarvam Bulbul v3)")
+    log.info(f"{'='*60}")
+    if not hindi_text or not hindi_text.strip():
+        raise PipelineError("Hindi text is empty — nothing to synthesise.")
+    response = _sarvam_post(
+        "text-to-speech",
+        payload={
+            "inputs": [hindi_text],
+            "target_language_code": "hi-IN",
+            "speaker": CONFIG["tts_speaker"],
+            "model": CONFIG["tts_model"],
+            "pitch": 0,
+            "pace": 1.0,
+            "loudness": 1.5,
+            "enable_preprocessing": True,
+        },
+        api_key=api_key,
+        description="Bulbul v3 TTS"
+    )
+    audio_b64 = response.get("audios", [None])[0]
+    if not audio_b64:
+        raise PipelineError("Bulbul v3 returned no audio. Check credits or text length.")
+    wav_path = os.path.join(output_dir, "hindi_dubbed.wav")
+    import base64
+    with open(wav_path, "wb") as f:
+        f.write(base64.b64decode(audio_b64))
+    _check_file(wav_path, "Generated audio")
+    log.info(f"  ✓ Audio: {wav_path} ({os.path.getsize(wav_path) / 1024:.0f} KB)")
+    return wav_path
