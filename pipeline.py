@@ -233,3 +233,57 @@ def generate_speech(hindi_text: str, output_dir: str, api_key: str) -> str:
     _check_file(wav_path, "Generated audio")
     log.info(f"  ✓ Audio: {wav_path} ({os.path.getsize(wav_path) / 1024:.0f} KB)")
     return wav_path
+# ── Stage 5: Audio Sync ──────────────────────────────────────────────────────
+def sync_audio(dubbed_path: str, clip_audio_path: str, output_dir: str) -> str:
+    """
+    Match dubbed audio duration to video duration using ffmpeg atempo.
+
+    atempo accepts 0.5–2.0. For ratios outside this range, chain two filters.
+    """
+    log.info(f"{'='*60}")
+    log.info(f"STAGE 5: AUDIO SYNC")
+    log.info(f"{'='*60}")
+
+    _check_file_exists(dubbed_path, "Dubbed audio")
+    _check_file_exists(clip_audio_path, "Original audio")
+
+    def _dur(path):
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True
+        )
+        return float(res.stdout.strip())
+
+    video_dur = _dur(clip_audio_path)
+    dub_dur   = _dur(dubbed_path)
+    ratio     = dub_dur / video_dur
+
+    log.info(f"  Video: {video_dur:.2f}s | Hindi TTS: {dub_dur:.2f}s | ratio: {ratio:.3f}x")
+
+    if ratio > 2.5 or ratio < 0.3:
+        log.warning(
+            f"  Extreme speed ratio ({ratio:.2f}x). "
+            f"Output may sound unnatural. Consider splitting the text."
+        )
+
+    synced_path = os.path.join(output_dir, "hindi_synced.wav")
+
+    if abs(ratio - 1.0) < 0.02:
+        shutil.copy(dubbed_path, synced_path)
+        log.info(f"  ✓ Already within 2% — no tempo adjustment needed")
+    else:
+        if 0.5 <= ratio <= 2.0:
+            atempo = f"atempo={ratio:.4f}"
+        elif ratio > 2.0:
+            atempo = f"atempo=2.0,atempo={ratio/2.0:.4f}"
+        else:
+            atempo = f"atempo=0.5,atempo={ratio/0.5:.4f}"
+
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-i", dubbed_path,
+            "-filter:a", atempo, synced_path
+        ], "Tempo adjustment")
+        log.info(f"  ✓ Synced with filter: {atempo}")
+
+    return synced_path
