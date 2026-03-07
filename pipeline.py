@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-pipeline.py — Kannada → Hindi Dubbing Pipeline with Sync.so Lipsync
-"""
-
 import argparse
 import base64
 import logging
@@ -38,7 +33,7 @@ CONFIG = {
     "output_dir": "output",
     "sarvam_base_url": "https://api.sarvam.ai",
     "sync_api_url": "https://api.sync.so/v2/generate",
-    "tts_speaker": "meera",
+    "tts_speaker": "anushka",
     "tts_model": "bulbul:v3",
     "translate_mode": "formal",
 }
@@ -48,6 +43,7 @@ CONFIG = {
 
 class PipelineError(Exception):
     pass
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -66,7 +62,8 @@ def _run_ffmpeg(cmd: list, description: str):
         raise PipelineError(f"{description} failed (exit {result.returncode}).\n{stderr}")
     return result
 
-def _sarvam_post(endpoint: str, payload: dict, api_key: str, files: dict = None, description: str = "Sarvam API") -> dict:
+def _sarvam_post(endpoint: str, payload: dict, api_key: str,
+                 files: dict = None, description: str = "Sarvam API") -> dict:
     url = f"{CONFIG['sarvam_base_url']}/{endpoint}"
     headers = {"api-subscription-key": api_key}
 
@@ -85,6 +82,28 @@ def _sarvam_post(endpoint: str, payload: dict, api_key: str, files: dict = None,
 
     return response.json()
 
+def _get_duration(path: str) -> float:
+    res = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+        capture_output=True, text=True
+    )
+    return float(res.stdout.strip())
+
+def _upload_file_public(file_path: str) -> str:
+    """Upload file to uguu.se and return a public URL (24hr expiry)."""
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            "https://uguu.se/upload",
+            files={"files[]": (os.path.basename(file_path), f)}
+        )
+    if resp.status_code != 200:
+        raise PipelineError(f"File upload failed (HTTP {resp.status_code}): {resp.text[:200]}")
+    data = resp.json()
+    url = data["files"][0]["url"]
+    log.info(f"  Public URL: {url}")
+    return url
+
+
 # ─── Stage 1: Extract ────────────────────────────────────────────────────────
 
 def extract_clip(input_video: str, start: int, end: int, output_dir: str) -> dict:
@@ -95,8 +114,7 @@ def extract_clip(input_video: str, start: int, end: int, output_dir: str) -> dic
 
     _check_file(input_video, "Input video")
 
-    duration = end - start
-    if duration <= 0:
+    if end <= start:
         raise PipelineError(f"Invalid time range: start={start}s >= end={end}s")
 
     os.makedirs(output_dir, exist_ok=True)
@@ -124,7 +142,8 @@ def extract_clip(input_video: str, start: int, end: int, output_dir: str) -> dic
 
     return paths
 
-# ─── Stage 2: Transcribe (Sarvam Saarika) ─────────────────────────────────────
+
+# ─── Stage 2: Transcribe (Sarvam Saarika) ────────────────────────────────────
 
 def transcribe(audio_path: str, output_dir: str, api_key: str) -> str:
     """Transcribe Kannada audio → Kannada text using Sarvam Saarika STT."""
@@ -162,7 +181,7 @@ def transcribe(audio_path: str, output_dir: str, api_key: str) -> str:
     return kannada_text
 
 
-# ─── Stage 3: Translate (Sarvam Mayura) ───────────────────────────────────────
+# ─── Stage 3: Translate (Sarvam Mayura) ──────────────────────────────────────
 
 def translate(kannada_text: str, output_dir: str, api_key: str) -> str:
     """Translate Kannada → Hindi using Sarvam Mayura (direct, no English hop)."""
@@ -188,7 +207,6 @@ def translate(kannada_text: str, output_dir: str, api_key: str) -> str:
     if not hindi_text:
         raise PipelineError("Mayura returned empty translation. Check API credits.")
 
-    # Validate Devanagari output
     devanagari = [c for c in hindi_text if '\u0900' <= c <= '\u097F']
     if not devanagari:
         log.warning("  ⚠ No Devanagari characters — output may be transliterated English")
@@ -200,14 +218,18 @@ def translate(kannada_text: str, output_dir: str, api_key: str) -> str:
 
     return hindi_text
 
+
 # ─── Stage 4: TTS (Sarvam Bulbul v3) ─────────────────────────────────────────
+
 def generate_speech(hindi_text: str, output_dir: str, api_key: str) -> str:
     """Generate Hindi speech using Sarvam Bulbul v3 TTS."""
     log.info(f"{'='*60}")
     log.info(f"STAGE 4: TTS (Sarvam Bulbul v3)")
     log.info(f"{'='*60}")
+
     if not hindi_text or not hindi_text.strip():
         raise PipelineError("Hindi text is empty — nothing to synthesise.")
+
     response = _sarvam_post(
         "text-to-speech",
         payload={
@@ -223,81 +245,155 @@ def generate_speech(hindi_text: str, output_dir: str, api_key: str) -> str:
         api_key=api_key,
         description="Bulbul v3 TTS"
     )
+
     audio_b64 = response.get("audios", [None])[0]
     if not audio_b64:
         raise PipelineError("Bulbul v3 returned no audio. Check credits or text length.")
+
     wav_path = os.path.join(output_dir, "hindi_dubbed.wav")
-    import base64
     with open(wav_path, "wb") as f:
         f.write(base64.b64decode(audio_b64))
+
     _check_file(wav_path, "Generated audio")
     log.info(f"  ✓ Audio: {wav_path} ({os.path.getsize(wav_path) / 1024:.0f} KB)")
     return wav_path
-# ── Stage 5: Audio Sync ──────────────────────────────────────────────────────
-def sync_audio(dubbed_path: str, clip_audio_path: str, output_dir: str) -> str:
-    """
-    Match dubbed audio duration to video duration using ffmpeg atempo.
 
-    atempo accepts 0.5–2.0. For ratios outside this range, chain two filters.
-    """
+
+# ─── Stage 5: Audio Sync ─────────────────────────────────────────────────────
+
+def sync_audio(dubbed_path: str, clip_audio_path: str, output_dir: str) -> str:
+    """Match dubbed audio duration to video duration using ffmpeg atempo."""
     log.info(f"{'='*60}")
     log.info(f"STAGE 5: AUDIO SYNC")
     log.info(f"{'='*60}")
 
-    _check_file_exists(dubbed_path, "Dubbed audio")
-    _check_file_exists(clip_audio_path, "Original audio")
+    _check_file(dubbed_path, "Dubbed audio")
+    _check_file(clip_audio_path, "Original audio")
 
-    def _dur(path):
-        res = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", path],
-            capture_output=True, text=True
-        )
-        return float(res.stdout.strip())
-
-    video_dur = _dur(clip_audio_path)
-    dub_dur   = _dur(dubbed_path)
-    ratio     = dub_dur / video_dur
+    video_dur = _get_duration(clip_audio_path)
+    dub_dur = _get_duration(dubbed_path)
+    ratio = dub_dur / video_dur
 
     log.info(f"  Video: {video_dur:.2f}s | Hindi TTS: {dub_dur:.2f}s | ratio: {ratio:.3f}x")
-
-    if ratio > 2.5 or ratio < 0.3:
-        log.warning(
-            f"  Extreme speed ratio ({ratio:.2f}x). "
-            f"Output may sound unnatural. Consider splitting the text."
-        )
 
     synced_path = os.path.join(output_dir, "hindi_synced.wav")
 
     if abs(ratio - 1.0) < 0.02:
         shutil.copy(dubbed_path, synced_path)
-        log.info(f"  ✓ Already within 2% — no tempo adjustment needed")
+        log.info(f"  ✓ Already within 2% — no adjustment needed")
     else:
         if 0.5 <= ratio <= 2.0:
             atempo = f"atempo={ratio:.4f}"
         elif ratio > 2.0:
-            atempo = f"atempo=2.0,atempo={ratio/2.0:.4f}"
+            atempo = f"atempo=2.0,atempo={ratio / 2.0:.4f}"
         else:
-            atempo = f"atempo=0.5,atempo={ratio/0.5:.4f}"
+            atempo = f"atempo=0.5,atempo={ratio / 0.5:.4f}"
 
         _run_ffmpeg([
             "ffmpeg", "-y", "-i", dubbed_path,
             "-filter:a", atempo, synced_path
         ], "Tempo adjustment")
-        log.info(f"  ✓ Synced with filter: {atempo}")
+        log.info(f"  ✓ Synced: {atempo}")
 
     return synced_path
-─ CLI (stages 1-5) ────────────────────────────────────────────────────────
+
+
+# ─── Stage 6: Lipsync (sync.so) ──────────────────────────────────────────────
+
+def lipsync(video_path: str, audio_path: str, output_dir: str, api_key: str) -> str:
+    """Lip-sync video to audio using sync.so API."""
+    log.info(f"{'='*60}")
+    log.info(f"STAGE 6: LIPSYNC (sync.so)")
+    log.info(f"{'='*60}")
+
+    _check_file(video_path, "Video clip")
+    _check_file(audio_path, "Synced audio")
+
+    headers = {"x-api-key": api_key}
+
+    # Convert WAV to MP3 (sync.so needs encoded audio, not raw PCM)
+    mp3_path = audio_path
+    if audio_path.endswith(".wav"):
+        mp3_path = audio_path.replace(".wav", ".mp3")
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-i", audio_path,
+            "-codec:a", "libmp3lame", "-qscale:a", "2", mp3_path
+        ], "WAV to MP3 conversion")
+        log.info(f"  ✓ Converted to MP3: {mp3_path}")
+
+    # Upload files to get public URLs
+    log.info("  Uploading video...")
+    video_url = _upload_file_public(video_path)
+
+    log.info("  Uploading audio...")
+    audio_url = _upload_file_public(mp3_path)
+
+    # Submit lipsync job
+    log.info("  Submitting lipsync job...")
+    job_resp = requests.post(
+        CONFIG["sync_api_url"],
+        headers={**headers, "Content-Type": "application/json"},
+        json={
+            "model": "lipsync-2",
+            "input": [
+                {"type": "video", "url": video_url},
+                {"type": "audio", "url": audio_url},
+            ]
+        },
+        timeout=30
+    ).json()
+
+    job_id = job_resp.get("id")
+    if not job_id:
+        raise PipelineError(f"sync.so job submission failed: {job_resp}")
+    log.info(f"  ✓ Job submitted (id: {job_id}). Polling...")
+
+    # Poll for completion (up to 5 min)
+    out_url = None
+    for attempt in range(60):
+        time.sleep(5)
+        status_resp = requests.get(
+            f"https://api.sync.so/v2/generate/{job_id}",
+            headers=headers, timeout=30
+        ).json()
+        status = status_resp.get("status", "unknown")
+        log.debug(f"  Poll {attempt + 1}: {status}")
+
+        if status.upper() == "COMPLETED":
+            out_url = status_resp.get("outputUrl")
+            break
+        if status.upper() in ("FAILED", "ERROR", "REJECTED"):
+            raise PipelineError(f"sync.so job {status}: {status_resp.get('error', 'unknown')}")
+
+    if not out_url:
+        raise PipelineError(f"sync.so timed out after 5 min. Job: {job_id}")
+
+    # Download result
+    output_path = os.path.join(output_dir, "final_dubbed.mp4")
+    log.info("  Downloading result...")
+    dl = requests.get(out_url, timeout=120)
+    with open(output_path, "wb") as f:
+        f.write(dl.content)
+
+    _check_file(output_path, "Lip-synced video")
+    log.info(f"  ✓ Done: {output_path} ({os.path.getsize(output_path) / (1024*1024):.1f} MB)")
+    return output_path
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Kannada → Hindi Dubbing Pipeline — Stages 1-5"
+        description="Kannada → Hindi Dubbing Pipeline with sync.so Lipsync"
     )
     parser.add_argument("--input", required=True, help="Input video path")
     parser.add_argument("--start", type=int, default=0, help="Clip start (seconds)")
     parser.add_argument("--end", type=int, required=True, help="Clip end (seconds)")
+    parser.add_argument("--output", default=None, help="Output video path")
     parser.add_argument("--sarvam-key", default=None,
                         help="Sarvam AI API key (or set SARVAM_API_KEY in .env)")
+    parser.add_argument("--sync-key", default=None,
+                        help="sync.so API key (or set SYNC_API_KEY in .env)")
     parser.add_argument("--verbose", action="store_true", help="Debug logging")
 
     args = parser.parse_args()
@@ -309,8 +405,22 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     sarvam_key = args.sarvam_key or os.getenv("SARVAM_API_KEY")
+    sync_key = args.sync_key or os.getenv("SYNC_API_KEY")
+
     if not sarvam_key:
         raise PipelineError("Sarvam API key required. Set SARVAM_API_KEY in .env or use --sarvam-key")
+    if not sync_key:
+        raise PipelineError("sync.so API key required. Set SYNC_API_KEY in .env or use --sync-key")
+
+    log.info("")
+    log.info("█" * 60)
+    log.info("  KANNADA → HINDI DUBBING PIPELINE (sync.so)")
+    log.info("█" * 60)
+    log.info(f"  Input   : {args.input}")
+    log.info(f"  Segment : {args.start}s – {args.end}s ({args.end - args.start}s)")
+    log.info("█" * 60)
+
+    start_time = time.time()
 
     try:
         # Stage 1: Extract
@@ -321,20 +431,34 @@ def main():
 
         # Stage 3: Translate
         hindi_text = translate(kannada_text, output_dir, sarvam_key)
-        
+
         # Stage 4: TTS
         dubbed_path = generate_speech(hindi_text, output_dir, sarvam_key)
 
         # Stage 5: Audio Sync
         synced_path = sync_audio(dubbed_path, paths["clip_audio"], output_dir)
 
+        # Stage 6: Lipsync
+        final_path = lipsync(paths["clip_video"], synced_path, output_dir, sync_key)
+
+        if args.output:
+            shutil.copy(final_path, args.output)
+            final_path = args.output
+
+        total = time.time() - start_time
         log.info("")
-        log.info("✅ Stages 1-5 complete. Audio is ready for lipsync.")
-        log.info(f"   Synced Audio: {synced_path}")
+        log.info("█" * 60)
+        log.info(f"  ✅ PIPELINE COMPLETE")
+        log.info(f"  Output: {final_path}")
+        log.info(f"  Total : {total:.1f}s")
+        log.info("█" * 60)
 
     except PipelineError as e:
         log.error(f"\n❌ Pipeline failed:\n{e}")
         sys.exit(1)
+    except KeyboardInterrupt:
+        log.warning("\n⚠ Interrupted.")
+        sys.exit(130)
 
 if __name__ == "__main__":
     main()
