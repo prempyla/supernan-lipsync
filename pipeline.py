@@ -287,3 +287,54 @@ def sync_audio(dubbed_path: str, clip_audio_path: str, output_dir: str) -> str:
         log.info(f"  ✓ Synced with filter: {atempo}")
 
     return synced_path
+─ CLI (stages 1-5) ────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Kannada → Hindi Dubbing Pipeline — Stages 1-5"
+    )
+    parser.add_argument("--input", required=True, help="Input video path")
+    parser.add_argument("--start", type=int, default=0, help="Clip start (seconds)")
+    parser.add_argument("--end", type=int, required=True, help="Clip end (seconds)")
+    parser.add_argument("--sarvam-key", default=None,
+                        help="Sarvam AI API key (or set SARVAM_API_KEY in .env)")
+    parser.add_argument("--verbose", action="store_true", help="Debug logging")
+
+    args = parser.parse_args()
+
+    global log
+    log = setup_logging(verbose=args.verbose)
+
+    output_dir = CONFIG["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+
+    sarvam_key = args.sarvam_key or os.getenv("SARVAM_API_KEY")
+    if not sarvam_key:
+        raise PipelineError("Sarvam API key required. Set SARVAM_API_KEY in .env or use --sarvam-key")
+
+    try:
+        # Stage 1: Extract
+        paths = extract_clip(args.input, args.start, args.end, output_dir)
+
+        # Stage 2: Transcribe
+        kannada_text = transcribe(paths["clip_audio"], output_dir, sarvam_key)
+
+        # Stage 3: Translate
+        hindi_text = translate(kannada_text, output_dir, sarvam_key)
+        
+        # Stage 4: TTS
+        dubbed_path = generate_speech(hindi_text, output_dir, sarvam_key)
+
+        # Stage 5: Audio Sync
+        synced_path = sync_audio(dubbed_path, paths["clip_audio"], output_dir)
+
+        log.info("")
+        log.info("✅ Stages 1-5 complete. Audio is ready for lipsync.")
+        log.info(f"   Synced Audio: {synced_path}")
+
+    except PipelineError as e:
+        log.error(f"\n❌ Pipeline failed:\n{e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
